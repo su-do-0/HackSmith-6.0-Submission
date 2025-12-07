@@ -1,0 +1,901 @@
+#!/usr/bin/env python3
+"""
+cmdhelp - Universal Command Line Helper
+Supports Linux, PowerShell, and CMD commands with cross-platform awareness
+Uses intelligent pattern matching and fuzzy search for suggestions
+"""
+
+import re
+import sys
+import os
+import platform
+from difflib import SequenceMatcher
+
+# Import databases
+try:
+    from command_database import COMPREHENSIVE_COMMAND_DB as LINUX_DB
+except ImportError as e:
+    # Fallback for standalone usage if DB missing (prevents crash)
+    LINUX_DB = {}
+    # print(f"Error: command_database.py not found - {e}") # Silent fail preferred for single file
+
+try:
+    from powershell_database import POWERSHELL_COMMAND_DB as POWERSHELL_DB
+except ImportError:
+    POWERSHELL_DB = {}
+
+try:
+    from cmd_database import CMD_COMMAND_DB as CMD_DB
+except ImportError:
+    CMD_DB = {}
+
+# Merge databases
+COMMAND_DB = {**LINUX_DB, **POWERSHELL_DB, **CMD_DB}
+LINUX_COUNT = len(LINUX_DB)
+POWERSHELL_COUNT = len(POWERSHELL_DB)
+CMD_COUNT = len(CMD_DB)
+DB_SIZE = len(COMMAND_DB)
+
+# Platform detection
+CURRENT_PLATFORM = 'powershell' if platform.system() == 'Windows' else 'linux'
+DEFAULT_PLATFORM = CURRENT_PLATFORM
+
+class Colors:
+    """ANSI color codes"""
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BOLD = '\033[1m'
+    END = '\033[0m'
+
+# Synonym groups for better matching
+SYNONYM_GROUPS = {
+    'remove': ['delete', 'erase', 'rm', 'del', 'uninstall'],
+    'find': ['search', 'locate', 'look for', 'discover'],
+    'copy': ['duplicate', 'cp', 'clone'],
+    'compress': ['zip', 'archive', 'pack', 'bundle'],
+    'decompress': ['unzip', 'extract', 'unpack', 'unarchive'],
+    'list': ['show', 'display', 'ls', 'view'],
+    'download': ['fetch', 'get', 'pull', 'retrieve'],
+    'large': ['big', 'huge', 'massive', 'giant'],
+    'recent': ['new', 'latest', 'newest', 'current'],
+    'old': ['ancient', 'outdated', 'aged'],
+    'modify': ['change', 'edit', 'update', 'alter'],
+    'create': ['make', 'generate', 'produce'],
+    'monitor': ['watch', 'track', 'observe'],
+    'kill': ['stop', 'terminate', 'end'],
+}
+
+# Natural language understanding patterns
+NLU_PATTERNS = {
+    r'how (?:do i|to|can i) (.+?)(?:\?|$)': lambda m: m.group(1),
+    r'what(?:\'s| is) the (?:command|way) to (.+?)(?:\?|$)': lambda m: m.group(1),
+    r'i (?:want to|need to|would like to) (.+?)(?:\?|$)': lambda m: m.group(1),
+    r'(?:can you |please )?(?:help me |show me how to )?(.+?)(?:\?|$)': lambda m: m.group(1),
+}
+
+# Command popularity scores (used in ranking)
+COMMAND_POPULARITY = {
+    'find': 10, 'grep': 10, 'ls': 9, 'cd': 8,
+    'tar': 8, 'ssh': 8, 'docker': 9, 'git': 10,
+    'ps': 7, 'kill': 7, 'top': 6, 'df': 7,
+    'Get-ChildItem': 9, 'Select-String': 8,
+    'Get-Process': 7, 'Get-Service': 7,
+}
+
+# Safety warnings for dangerous commands
+SAFETY_HINTS = {
+    'rm ': 'Consider using -i (interactive) to confirm each deletion',
+    'rm -rf': '⚠️  WARNING: This will delete recursively without confirmation!',
+    'delete': 'Consider backing up important data first',
+    'DROP': '⚠️  WARNING: This will permanently delete data!',
+    'dd ': '⚠️  WARNING: dd can destroy data if used incorrectly!',
+    'format': '⚠️  WARNING: Formatting will erase all data on the disk!',
+}
+
+# Performance hints
+PERFORMANCE_HINTS = {
+    'tar': 'Add -v flag to see progress for large archives',
+    'rsync': 'Use -v or --progress to monitor transfer',
+    'cp -r': 'Add -v to see which files are being copied',
+    'find .': 'Consider limiting depth with -maxdepth for faster results',
+}
+
+# Intelligent suggestions with platform hints
+INTELLIGENT_SUGGESTIONS = {
+    # File finding (cross-platform)
+    ('find.*large.*file', 'linux'): 'find . -type f -size +100M -exec ls -lh {} \\;',
+    ('find.*large.*file', 'powershell'): 'Get-ChildItem -Recurse | Where-Object {$_.Length -gt 100MB} | Select-Object FullName, @{N="SizeMB";E={[math]::Round($_.Length/1MB,2)}}',
+    ('find.*big.*file', 'linux'): 'find . -type f -size +100M -exec ls -lh {} \\;',
+    ('find.*big.*file', 'powershell'): 'Get-ChildItem -Recurse | Where-Object {$_.Length -gt 100MB}',
+    ('find.*recent.*file', 'linux'): 'find . -type f -mtime -7',
+    ('find.*recent.*file', 'powershell'): 'Get-ChildItem -Recurse | Where-Object {$_.LastWriteTime -gt (Get-Date).AddDays(-7)}',
+    ('find.*modified.*file', 'linux'): 'find . -type f -mtime -7 -ls',
+    ('find.*old.*file', 'linux'): 'find . -type f -mtime +30',
+    ('find.*pdf', 'linux'): 'find . -type f -name "*.pdf"',
+    ('find.*pdf', 'powershell'): 'Get-ChildItem -Recurse -Filter *.pdf',
+    ('find.*name', 'linux'): 'find . -name "pattern"',
+    ('search.*file', 'linux'): 'find . -name "pattern"',
+    ('search.*file', 'powershell'): 'Get-ChildItem -Recurse -Filter pattern',
+    
+    # Disk operations
+    ('disk.*usage', 'linux'): 'du -sh * | sort -h',
+    ('disk.*usage', 'powershell'): 'Get-ChildItem | ForEach-Object {[PSCustomObject]@{Name=$_.Name; SizeMB=[math]::Round((Get-ChildItem $_.FullName -Recurse | Measure-Object -Property Length -Sum).Sum/1MB,2)}} | Sort-Object SizeMB -Descending',
+    ('disk.*space', 'linux'): 'df -h',
+    ('disk.*space', 'powershell'): 'Get-PSDrive -PSProvider FileSystem',
+    ('check.*disk', 'linux'): 'df -h',
+    ('largest.*director', 'linux'): 'du -sh */ | sort -h | tail -10',
+    ('folder.*size', 'linux'): 'du -sh *',
+    ('folder.*size', 'powershell'): 'Get-ChildItem | ForEach-Object {[PSCustomObject]@{Name=$_.Name; SizeMB=[math]::Round((Get-ChildItem $_.FullName -Recurse | Measure-Object -Property Length -Sum).Sum/1MB,2)}}',
+    ('directory.*size', 'linux'): 'du -h --max-depth=1 | sort -h',
+    ('top.*10.*largest', 'linux'): 'du -sh */ | sort -h | tail -10',
+    
+    # Compression
+    ('compress.*folder', 'linux'): 'tar -czf archive.tar.gz folder/',
+    ('compress.*folder', 'powershell'): 'Compress-Archive -Path folder -DestinationPath archive.zip',
+    ('zip.*folder', 'linux'): 'tar -czf archive.tar.gz folder/',
+    ('zip.*folder', 'powershell'): 'Compress-Archive -Path folder -DestinationPath archive.zip',
+    ('create.*archive', 'linux'): 'tar -czf archive.tar.gz folder/',
+    ('create.*archive', 'powershell'): 'Compress-Archive -Path folder -DestinationPath archive.zip',
+    ('extract.*tar', 'linux'): 'tar -xzf archive.tar.gz',
+    ('extract.*zip', 'powershell'): 'Expand-Archive -Path archive.zip -DestinationPath .',
+    ('unzip', 'linux'): 'tar -xzf archive.tar.gz',
+    ('unzip', 'powershell'): 'Expand-Archive -Path archive.zip',
+    ('decompress', 'linux'): 'tar -xzf archive.tar.gz',
+    ('decompress', 'powershell'): 'Expand-Archive -Path archive.zip',
+    
+    # Text search
+    ('search.*text', 'linux'): 'grep -r "pattern" .',
+    ('search.*text', 'powershell'): 'Select-String -Path * -Pattern "pattern" -Recurse',
+    ('find.*text', 'linux'): 'grep -r "pattern" .',
+    ('find.*text', 'powershell'): 'Select-String -Pattern "pattern" -Recurse',
+    ('search.*in.*file', 'linux'): 'grep -r "pattern" .',
+    ('find.*string', 'linux'): 'grep -r "pattern" .',
+    ('search.*word', 'linux'): 'grep -rw "word" .',
+    
+    # Process management  
+    ('kill.*process', 'linux'): 'kill -9 PID',
+    ('kill.*process', 'powershell'): 'Stop-Process -Id PID -Force',
+    ('stop.*process', 'linux'): 'kill -15 PID',
+    ('stop.*process', 'powershell'): 'Stop-Process -Id PID',
+    ('list.*process', 'linux'): 'ps aux',
+    ('list.*process', 'powershell'): 'Get-Process',
+    ('running.*process', 'linux'): 'ps aux | grep name',
+    ('running.*process', 'powershell'): 'Get-Process | Where-Object {$_.ProcessName -like "*name*"}',
+    ('find.*process', 'linux'): 'ps aux | grep name',
+    ('cpu.*usage', 'linux'): 'top -bn1 | head -20',
+    ('cpu.*usage', 'powershell'): 'Get-Process | Sort-Object CPU -Descending | Select-Object -First 10',
+    ('memory.*usage', 'linux'): 'free -h',
+    ('memory.*usage', 'powershell'): 'Get-Process | Sort-Object WS -Descending | Select-Object -First 10',
+    
+    # Network
+    ('download.*file', 'linux'): 'wget URL',
+    ('download.*file', 'powershell'): 'Invoke-WebRequest -Uri URL -OutFile filename',
+    ('download', 'linux'): 'wget URL',
+    ('download', 'powershell'): 'Invoke-WebRequest -Uri URL -OutFile filename',
+    ('get.*file.*url', 'linux'): 'curl -O URL',
+    ('ssh.*connect', 'linux'): 'ssh user@host',
+    ('remote.*connect', 'linux'): 'ssh user@host',
+    ('copy.*remote', 'linux'): 'scp file user@host:/path',
+    ('transfer.*file', 'linux'): 'scp file user@host:/path',
+    ('sync.*files', 'linux'): 'rsync -avz source/ dest/',
+    ('check.*port', 'linux'): 'netstat -tulpn | grep :PORT',
+    ('listen.*port', 'linux'): 'netstat -tulpn',
+    ('dns.*lookup', 'linux'): 'dig domain.com',
+    ('ip.*address', 'linux'): 'ip addr show',
+    ('ip.*address', 'powershell'): 'Get-NetIPAddress',
+    ('network.*interface', 'linux'): 'ip link show',
+    ('ping.*host', 'linux'): 'ping -c 4 host',
+    ('ping.*host', 'powershell'): 'Test-Connection -ComputerName host -Count 4',
+    
+    # Services
+    ('list.*service', 'linux'): 'systemctl list-units --type=service',
+    ('list.*service', 'powershell'): 'Get-Service',
+    ('start.*service', 'linux'): 'systemctl start servicename',
+    ('start.*service', 'powershell'): 'Start-Service -Name servicename',
+    ('stop.*service', 'linux'): 'systemctl stop servicename',
+    ('stop.*service', 'powershell'): 'Stop-Service -Name servicename',
+    ('restart.*service', 'linux'): 'systemctl restart servicename',
+    ('restart.*service', 'powershell'): 'Restart-Service -Name servicename',
+    
+    # System info
+    ('system.*info', 'linux'): 'uname -a',
+    ('system.*info', 'powershell'): 'Get-ComputerInfo',
+    ('kernel.*version', 'linux'): 'uname -r',
+    ('os.*version', 'linux'): 'cat /etc/os-release',
+    ('os.*version', 'powershell'): 'Get-ComputerInfo | Select-Object WindowsVersion',
+    ('who.*logged', 'linux'): 'who',
+    ('current.*users', 'linux'): 'w',
+    ('uptime', 'linux'): 'uptime',
+    ('load.*average', 'linux'): 'uptime',
+    
+    # File operations
+    ('copy.*file', 'linux'): 'cp source dest',
+    ('copy.*file', 'powershell'): 'Copy-Item -Path source -Destination dest',
+    ('move.*file', 'linux'): 'mv source dest',
+    ('move.*file', 'powershell'): 'Move-Item -Path source -Destination dest',
+    ('delete.*file', 'linux'): 'rm file',
+    ('delete.*file', 'powershell'): 'Remove-Item -Path file',
+    ('remove.*file', 'linux'): 'rm file',
+    ('remove.*file', 'powershell'): 'Remove-Item -Path file',
+    ('create.*directory', 'linux'): 'mkdir dirname',
+    ('create.*directory', 'powershell'): 'New-Item -ItemType Directory -Path dirname',
+    ('make.*folder', 'linux'): 'mkdir dirname',
+    ('make.*folder', 'powershell'): 'New-Item -ItemType Directory -Path dirname',
+    ('change.*permission', 'linux'): 'chmod 755 file',
+    ('change.*owner', 'linux'): 'chown user:group file',
+    
+    # File viewing
+    ('view.*file', 'linux'): 'less file',
+    ('view.*file', 'powershell'): 'Get-Content file | Out-Host -Paging',
+    ('read.*file', 'linux'): 'cat file',
+    ('read.*file', 'powershell'): 'Get-Content file',
+    ('tail.*log', 'linux'): 'tail -f /var/log/syslog',
+    ('tail.*log', 'powershell'): 'Get-Content logfile -Wait -Tail 10',
+    ('follow.*log', 'linux'): 'tail -f logfile',
+    ('follow.*log', 'powershell'): 'Get-Content logfile -Wait',
+    ('watch.*log', 'linux'): 'tail -f logfile',
+    ('count.*lines', 'linux'): 'wc -l file',
+    ('count.*lines', 'powershell'): '(Get-Content file).Count',
+    
+    # Sorting and filtering
+    ('sort.*by.*size', 'linux'): 'ls -lS',
+    ('sort.*by.*size', 'powershell'): 'Get-ChildItem | Sort-Object Length -Descending',
+    ('sort.*by.*size', 'cmd'): 'dir /O:S',
+    ('sort.*by.*time', 'linux'): 'ls -lt',
+    ('sort.*by.*time', 'powershell'): 'Get-ChildItem | Sort-Object LastWriteTime -Descending',
+    ('sort.*by.*time', 'cmd'): 'dir /O:-D',
+    ('sort.*file', 'linux'): 'sort file',
+    ('sort.*file', 'cmd'): 'sort < file.txt',
+    ('unique.*lines', 'linux'): 'sort file | uniq',
+    ('remove.*duplicate', 'linux'): 'sort file | uniq',
+    
+    # CMD-specific patterns
+    ('list.*files', 'cmd'): 'dir',
+    ('list.*director', 'cmd'): 'dir /A:D',
+    ('show.*files', 'cmd'): 'dir',
+    ('change.*director', 'cmd'): 'cd folder',
+    ('copy.*file', 'cmd'): 'copy source dest',
+    ('delete.*file', 'cmd'): 'del file',
+    ('remove.*file', 'cmd'): 'del file',
+    ('create.*folder', 'cmd'): 'mkdir foldername',
+    ('make.*director', 'cmd'): 'mkdir foldername',
+    ('remove.*director', 'cmd'): 'rmdir /S foldername',
+    ('search.*text', 'cmd'): 'findstr "pattern" file.txt',
+    ('find.*text', 'cmd'): 'findstr "pattern" *.txt',
+    ('network.*info', 'cmd'): 'ipconfig /all',
+    ('ip.*address', 'cmd'): 'ipconfig',
+    ('list.*process', 'cmd'): 'tasklist',
+    ('kill.*process', 'cmd'): 'taskkill /F /IM process.exe',
+    ('stop.*process', 'cmd'): 'taskkill /PID processid',
+    ('system.*info', 'cmd'): 'systeminfo',
+    ('clear.*screen', 'cmd'): 'cls',
+    ('check.*disk', 'cmd'): 'chkdsk C:',
+    ('format.*drive', 'cmd'): 'format D: /FS:NTFS',
+}
+
+def expand_with_synonyms(text):
+    """Expand text with synonyms for better matching"""
+    words = text.lower().split()
+    expanded_words = set(words)
+    
+    for word in words:
+        # Check if word is in any synonym group
+        for key_word, synonyms in SYNONYM_GROUPS.items():
+            if word == key_word or word in synonyms:
+                expanded_words.add(key_word)
+                expanded_words.update(synonyms)
+    
+    return ' '.join(expanded_words)
+
+def parse_natural_language(description):
+    """Extract intent from natural language queries"""
+    for pattern, extractor in NLU_PATTERNS.items():
+        match = re.match(pattern, description.lower().strip())
+        if match:
+            return extractor(match)
+    return description
+
+def fuzzy_match(s1, s2, threshold=0.6):
+    """Check if two strings are similar enough"""
+    return SequenceMatcher(None, s1.lower(), s2.lower()).ratio() >= threshold
+
+def find_command_fuzzy(cmd_input):
+    """
+    Find a command using fuzzy matching, case-insensitive search, and alias resolution.
+    Returns: (matched_command, match_type) or (None, None)
+    """
+    cmd_lower = cmd_input.lower().strip()
+    
+    # 1. Try exact match (case-sensitive)
+    if cmd_input in COMMAND_DB:
+        return cmd_input, 'exact'
+    
+    # 2. Try case-insensitive exact match
+    for cmd in COMMAND_DB.keys():
+        if cmd.lower() == cmd_lower:
+            return cmd, 'case-insensitive'
+    
+    # 3. Try alias match (case-insensitive)
+    for cmd, info in COMMAND_DB.items():
+        if 'alias' in info:
+            for alias in info['alias']:
+                if alias.lower() == cmd_lower:
+                    return cmd, 'alias'
+        # Also check 'aliases' key for backward compatibility
+        if 'aliases' in info:
+            for alias in info['aliases']:
+                if alias.lower() == cmd_lower:
+                    return cmd, 'alias'
+    
+    # 4. Try partial match (for PowerShell cmdlets like "get-child" -> "Get-ChildItem")
+    partial_matches = []
+    
+    for cmd in COMMAND_DB.keys():
+        if cmd.lower().startswith(cmd_lower):
+            partial_matches.append(cmd)
+        # Also check if input is a substring
+        elif cmd_lower in cmd.lower():
+            partial_matches.append((cmd, len(cmd)))  # Shorter matches are better
+    
+    # If we have partial matches, return the best one (shortest)
+    if partial_matches:
+        if isinstance(partial_matches[0], tuple):
+            partial_matches.sort(key=lambda x: x[1])
+            return partial_matches[0][0], 'partial'
+        else:
+            # If startswith matches, prefer those
+            return partial_matches[0], 'partial'
+    
+    # 5. Try fuzzy matching (for typos)
+    fuzzy_matches = []
+    for cmd in COMMAND_DB.keys():
+        similarity = SequenceMatcher(None, cmd_lower, cmd.lower()).ratio()
+        if similarity >= 0.6:  # 60% similarity threshold
+            fuzzy_matches.append((cmd, similarity))
+    
+    if fuzzy_matches:
+        # Sort by similarity (highest first)
+        fuzzy_matches.sort(key=lambda x: x[1], reverse=True)
+        return fuzzy_matches[0][0], 'fuzzy'
+    
+    return None, None
+
+def calculate_relevance_score(pattern, description, command, platform, target_platform=None):
+    """Multi-factor scoring for better suggestions"""
+    score = 0
+    
+    # Expand description with synonyms
+    expanded_desc = expand_with_synonyms(description)
+    
+    # Exact pattern match (highest weight)
+    if re.search(pattern, expanded_desc.lower()):
+        score += 100
+    
+    # Pattern specificity (longer = more specific)
+    score += len(pattern) * 2
+    
+    # Keyword overlap
+    pattern_words = set(pattern.replace('.*', ' ').replace('[^a-z]*', ' ').split())
+    desc_words = set(expanded_desc.lower().split())
+    overlap = len(pattern_words & desc_words)
+    score += overlap * 30
+    
+    # Fuzzy match bonus
+    if fuzzy_match(pattern.replace('.*', ' '), description):
+        score += 25
+    
+    # Command popularity boost
+    base_cmd = command.split()[0]
+    score += COMMAND_POPULARITY.get(base_cmd, 0) * 5
+    
+    # Platform match bonus - use target_platform if provided, else DEFAULT_PLATFORM
+    check_platform = target_platform if target_platform else DEFAULT_PLATFORM
+    if platform == check_platform:
+        score += 50  # Increased bonus for platform match
+    
+    return score
+
+def intelligent_suggest(description, target_platform=None):
+    """Use intelligent pattern matching to suggest commands"""
+    # Parse natural language
+    parsed_desc = parse_natural_language(description)
+    
+    # Determine target platform
+    if not target_platform:
+        target_platform = DEFAULT_PLATFORM
+    
+    # Expand description with synonyms
+    expanded_desc = expand_with_synonyms(parsed_desc)
+    
+    # Try regex pattern matching with scoring
+    matches = []
+    for (pattern, platform), cmd in INTELLIGENT_SUGGESTIONS.items():
+        if re.search(pattern, expanded_desc.lower()):
+            score = calculate_relevance_score(pattern, parsed_desc, cmd, platform, target_platform)
+            matches.append((pattern, cmd, score, platform))
+    
+    # Sort by relevance score
+    matches.sort(key=lambda x: x[2], reverse=True)
+    
+    if matches:
+        return [(m[0], m[1], m[3], m[2]) for m in matches]
+    
+    # Fallback: keyword matching with fuzzy search
+    keywords = expanded_desc.split()
+    keyword_matches = []
+    for (pattern, platform), cmd in INTELLIGENT_SUGGESTIONS.items():
+        pattern_keywords = pattern.replace('.*', ' ').replace('[^a-z]*', ' ').split()
+        overlap = sum(1 for kw in keywords if any(fuzzy_match(kw, pk, 0.7) for pk in pattern_keywords))
+        
+        if overlap > 0:
+            score = overlap * 20 + COMMAND_POPULARITY.get(cmd.split()[0], 0) * 5
+            # Add platform bonus
+            if platform == target_platform:
+                score += 50
+            keyword_matches.append((pattern, cmd, score, platform))
+    
+    keyword_matches.sort(key=lambda x: x[2], reverse=True)
+    return [(m[0], m[1], m[3], m[2]) for m in keyword_matches[:5]]
+
+def get_safety_hints(command):
+    """Return safety hints for dangerous commands"""
+    hints = []
+    for pattern, hint in SAFETY_HINTS.items():
+        if pattern in command:
+            hints.append(hint)
+    return hints
+
+def get_performance_hints(command):
+    """Return performance hints for commands"""
+    hints = []
+    for pattern, hint in PERFORMANCE_HINTS.items():
+        if pattern in command:
+            hints.append(hint)
+    return hints
+
+def format_platform_indicator(platform):
+    """Return platform icon and name"""
+    if platform == 'linux':
+        return '🐧 Linux', 'linux'
+    elif platform == 'cmd':
+        return '⊞ CMD', 'cmd'
+    else:
+        return '🪟 PowerShell', 'powershell'
+
+def suggest_command(description, force_platform=None):
+    """Suggest commands using intelligent pattern matching and similarity search"""
+    target_platform = force_platform or DEFAULT_PLATFORM
+    
+    print(f"\n{Colors.CYAN}💡 Finding command for: {Colors.BOLD}{description}{Colors.END}")
+    
+    # Try Local Intelligent Suggestion
+    matches = intelligent_suggest(description, target_platform)
+    
+    best_match = None
+    source = "Local Database"
+    MIN_SCORE = 50  # Lowered threshold since no AI fallback
+    
+    if matches:
+        # matches[0] is now (pattern, cmd, platform, score)
+        local_score = matches[0][3]
+        
+        if local_score >= MIN_SCORE:
+            best_match = matches[0] # Strong local match found
+            cmd = best_match[1]
+            platform = best_match[2]
+        else:
+            # Show score even if below threshold
+            print(f"{Colors.YELLOW}💡 Best match score: {local_score} (threshold: {MIN_SCORE}){Colors.END}")
+            print(f"{Colors.YELLOW}   Consider: {matches[0][1]}{Colors.END}\n")
+    
+    # Display Results
+    if best_match:
+        icon, platform_name = format_platform_indicator(platform)
+        
+        print(f"{Colors.GREEN}╔══ RECOMMENDED ({icon}) ══[{source}]════════════════{Colors.END}")
+        print(f"{Colors.GREEN}║{Colors.END} {Colors.BOLD}{Colors.CYAN}{cmd}{Colors.END}")
+        print(f"{Colors.GREEN}╚════════════════════════════════════════════════════════{Colors.END}\n")
+        
+        # Explain the command (for local matches only)
+        base_cmd = cmd.split()[0]
+        if source == "Local Database" and base_cmd in COMMAND_DB:
+            print(f"{Colors.BLUE}💡 What this does:{Colors.END} {COMMAND_DB[base_cmd]['desc']}\n")
+        
+        # Safety hints (Run AI commands through safety checks too!)
+        safety_hints = get_safety_hints(cmd)
+        if safety_hints:
+            for hint in safety_hints:
+                print(f"{Colors.RED}⚠️  {hint}{Colors.END}\n")
+        
+        # Performance hints
+        perf_hints = get_performance_hints(cmd)
+        if perf_hints:
+            for hint in perf_hints:
+                print(f"{Colors.YELLOW}💡 Hint:{Colors.END} {hint}\n")
+
+        # Show alternatives
+        if source == "Local Database":
+            alternatives_same_platform = [m for m in matches if m[2] == target_platform and m != matches[0]]
+            alternatives_other_platform = [m for m in matches if m[2] != target_platform]
+
+            if alternatives_same_platform:
+                print(f"{Colors.BLUE}🔄 Alternative approaches ({platform_name}):{Colors.END}")
+                for pattern, cmd, plat in alternatives_same_platform[:3]:
+                    base = cmd.split()[0]
+                    desc = COMMAND_DB.get(base, {}).get('desc', 'Similar command')
+                    print(f"  {Colors.CYAN}•{Colors.END} {Colors.GREEN}{cmd}{Colors.END}")
+                    print(f"    {desc}")
+                print()
+                
+            if alternatives_other_platform:
+                other_platform = 'linux' if target_platform == 'powershell' else 'powershell'
+                other_icon, other_name = format_platform_indicator(other_platform)
+                print(f"{Colors.BLUE}💻 Cross-platform alternative ({other_icon}):{Colors.END}")
+                alt_cmd = alternatives_other_platform[0][1]
+                alt_base = alt_cmd.split()[0]
+                alt_desc = COMMAND_DB.get(alt_base, {}).get('desc', 'Similar command')
+                print(f"  {Colors.CYAN}{alt_cmd}{Colors.END}")
+                print(f"  {alt_desc}\n")
+
+    else:
+        print(f"{Colors.YELLOW}❌ No direct matches found.{Colors.END}\n")
+        print(f"{Colors.CYAN}💡 Try these approaches:{Colors.END}")
+        print(f"  {Colors.YELLOW}• cmdhelp list{Colors.END}           - Browse all {DB_SIZE} commands")
+        print(f"  {Colors.YELLOW}• cmdhelp list {target_platform}{Colors.END}  - Show {target_platform} commands only")
+        
+        if target_platform == 'linux':
+            print(f"  {Colors.YELLOW}• man -k <keyword>{Colors.END}      - Search system man pages")
+            print(f"  {Colors.YELLOW}• apropos <keyword>{Colors.END}     - Find related commands\n")
+        else:
+            print(f"  {Colors.YELLOW}• Get-Help *keyword*{Colors.END}    - Search PowerShell help\n")
+        
+        # Show some popular commands for the platform
+        print(f"{Colors.BLUE}🌟 Popular {target_platform} commands you might find useful:{Colors.END}")
+        if target_platform == 'linux':
+            popular = [
+                ('find', 'Search for files'),
+                ('grep', 'Search text patterns'),
+                ('du', 'Check disk usage'),
+                ('tar', 'Archive files'),
+                ('ssh', 'Remote access')
+            ]
+        else:
+            popular = [
+                ('Get-ChildItem', 'List files and directories'),
+                ('Select-String', 'Search text patterns'),
+                ('Get-Process', 'List processes'),
+                ('Get-Service', 'Manage services'),
+                ('Invoke-WebRequest', 'Download files')
+            ]
+        
+        for cmd, desc in popular:
+            if cmd in COMMAND_DB:
+                print(f"  {Colors.GREEN}{cmd:20}{Colors.END} {desc}")
+        print()
+
+def parse_command(cmd_string):
+    """Parse command into base command, flags, and arguments"""
+    parts = cmd_string.split()
+    if not parts:
+        return None, [], []
+    
+    base_cmd = parts[0]
+    flags = []
+    args = []
+    
+    for part in parts[1:]:
+        if part.startswith('-'):
+            flags.append(part)
+        else:
+            args.append(part)
+    
+    return base_cmd, flags, args
+
+def explain_command(cmd_string):
+    """Explain a command using built-in knowledge"""
+    base_cmd, flags, args = parse_command(cmd_string)
+    
+    # Try to find the command with fuzzy matching
+    matched_cmd, match_type = find_command_fuzzy(base_cmd)
+    
+    if not matched_cmd:
+        print(f"\n{Colors.CYAN}🔍 Analyzing: {Colors.BOLD}{cmd_string}{Colors.END}\n")
+        print(f"{Colors.YELLOW}❌ Command '{base_cmd}' not found in database.{Colors.END}\n")
+        
+        # Suggest similar commands
+        print(f"{Colors.CYAN}💡 Did you mean one of these?{Colors.END}")
+        suggestions = []
+        for cmd in COMMAND_DB.keys():
+            similarity = SequenceMatcher(None, base_cmd.lower(), cmd.lower()).ratio()
+            if similarity >= 0.4:
+                suggestions.append((cmd, similarity))
+        
+        suggestions.sort(key=lambda x: x[1], reverse=True)
+        for cmd, sim in suggestions[:5]:
+            platform_icon = '🪟' if cmd in POWERSHELL_DB else '🐧'
+            print(f"  {platform_icon} {Colors.GREEN}{cmd}{Colors.END} (similarity: {int(sim*100)}%)")
+        
+        print(f"\n{Colors.CYAN}💡 Try:{Colors.END}")
+        if CURRENT_PLATFORM == 'linux':
+            print(f"  {Colors.YELLOW}• man {base_cmd}{Colors.END}         - Check system manual")
+            print(f"  {Colors.YELLOW}• which {base_cmd}{Colors.END}       - Find command location")
+            print(f"  {Colors.YELLOW}• {base_cmd} --help{Colors.END}      - Show command help\n")
+        else:
+            print(f"  {Colors.YELLOW}• Get-Help {base_cmd}{Colors.END}    - Check PowerShell help")
+            print(f"  {Colors.YELLOW}• Get-Command {base_cmd}{Colors.END} - Find command details\n")
+        return
+    
+    # Show what we matched  
+    print(f"\n{Colors.CYAN}🔍 Analyzing: {Colors.BOLD}{cmd_string}{Colors.END}\n")
+    
+    # Show match information if not exact
+    if match_type == 'case-insensitive':
+        print(f"{Colors.YELLOW}📝 Matched '{base_cmd}' → '{matched_cmd}' (case-insensitive){Colors.END}\n")
+    elif match_type == 'alias':
+        print(f"{Colors.GREEN}📝 Recognized alias '{base_cmd}' → '{matched_cmd}'{Colors.END}\n")
+    elif match_type == 'partial':
+        print(f"{Colors.YELLOW}📝 Partial match '{base_cmd}' → '{matched_cmd}'{Colors.END}\n")
+    elif match_type == 'fuzzy':
+        print(f"{Colors.YELLOW}📝 Fuzzy match '{base_cmd}' → '{matched_cmd}' (typo corrected){Colors.END}\n")
+    
+    # Determine platform - prefer current OS platform
+    # Check which databases have the command
+    in_linux = matched_cmd in LINUX_DB
+    in_cmd = matched_cmd in CMD_DB
+    in_ps = matched_cmd in POWERSHELL_DB
+    
+    # Prefer current platform if command exists there
+    if CURRENT_PLATFORM == 'linux' and in_linux:
+        platform_name = 'Linux'
+        icon = '🐧'
+        info = LINUX_DB[matched_cmd]
+    elif CURRENT_PLATFORM == 'powershell' and in_ps:
+        platform_name = 'PowerShell'
+        icon = '🪟'
+        info = POWERSHELL_DB[matched_cmd]
+    elif CURRENT_PLATFORM == 'powershell' and in_cmd:
+        platform_name = 'CMD'
+        icon = '⊞'
+        info = CMD_DB[matched_cmd]
+    # Otherwise, check in order
+    elif in_cmd:
+        platform_name = 'CMD'
+        icon = '⊞'
+        info = CMD_DB[matched_cmd]
+    elif in_ps:
+        platform_name = 'PowerShell'
+        icon = '🪟'
+        info = POWERSHELL_DB[matched_cmd]
+    else:
+        platform_name = 'Linux'
+        icon = '🐧'
+        info = LINUX_DB.get(matched_cmd, COMMAND_DB.get(matched_cmd, {}))
+    print(f"{Colors.BOLD}{Colors.BLUE}PLATFORM:{Colors.END} {icon} {platform_name}\n")
+    
+    # Description
+    print(f"{Colors.BOLD}{Colors.BLUE}DESCRIPTION:{Colors.END}")
+    print(f"  {info['desc']}\n")
+    
+    # Aliases
+    alias_key = 'alias' if 'alias' in info else 'aliases'
+    if alias_key in info and info[alias_key]:
+        print(f"{Colors.BOLD}{Colors.BLUE}ALIASES:{Colors.END}")
+        print(f"  {', '.join(info[alias_key])}\n")
+    
+    # Flags/Parameters used in this command
+    flag_key = 'common_parameters' if 'common_parameters' in info else 'common_flags'
+    flag_label = 'PARAMETERS' if platform_name == 'PowerShell' else 'FLAGS'
+    
+    if flags:
+        print(f"{Colors.BOLD}{Colors.BLUE}{flag_label} USED:{Colors.END}")
+        for flag in flags:
+            # Handle combined flags like -la
+            if len(flag) > 2 and not flag.startswith('--') and platform_name == 'Linux':
+                for char in flag[1:]:
+                    single_flag = f'-{char}'
+                    if single_flag in info[flag_key]:
+                        print(f"  {Colors.GREEN}{single_flag:15}{Colors.END} {info[flag_key][single_flag]}")
+            elif flag in info[flag_key]:
+                print(f"  {Colors.GREEN}{flag:15}{Colors.END} {info[flag_key][flag]}")
+            else:
+                print(f"  {Colors.YELLOW}{flag:15}{Colors.END} (not in database)")
+        print()
+    
+    # Common flags/parameters reference
+    print(f"{Colors.BOLD}{Colors.BLUE}COMMON {flag_label}:{Colors.END}")
+    flag_items = list(info[flag_key].items())[:15]
+    for flag, desc in flag_items:
+        is_used = False
+        if flag in flags:
+            is_used = True
+        elif any(len(f) > 2 and not f.startswith('--') and flag[1:] in f for f in flags):
+            is_used = True
+        
+        color = Colors.GREEN if is_used else Colors.YELLOW
+        marker = '✓ ' if is_used else '  '
+        print(f"  {marker}{color}{flag:15}{Colors.END} {desc}")
+    
+    if len(info[flag_key]) > 15:
+        print(f"  {Colors.YELLOW}  ... and {len(info[flag_key]) - 15} more {flag_label.lower()}{Colors.END}")
+    print()
+    
+    # Examples
+    if info['examples']:
+        print(f"{Colors.BOLD}{Colors.BLUE}EXAMPLES:{Colors.END}")
+        for example in info['examples'][:5]:
+            print(f"  {Colors.CYAN}{example}{Colors.END}")
+        print()
+    
+    # Full documentation reference
+    if platform_name == 'PowerShell':
+        print(f"{Colors.BLUE}📖 For complete documentation:{Colors.END}")
+        print(f"   Get-Help {matched_cmd} -Detailed\n")
+    else:
+        print(f"{Colors.BLUE}📖 For complete documentation:{Colors.END}")
+        print(f"   man {matched_cmd}\n")
+    
+    # Cross-platform comparison
+    show_cross_platform_differences(matched_cmd, platform_name)
+
+def show_cross_platform_differences(cmd, current_platform):
+    """Show how this command differs on other platforms"""
+    # Check if command exists on other platforms
+    other_platforms = []
+    
+    if current_platform != 'Linux' and cmd in LINUX_DB:
+        other_platforms.append(('Linux', '🐧', LINUX_DB[cmd]))
+    if current_platform != 'PowerShell' and cmd in POWERSHELL_DB:
+        other_platforms.append(('PowerShell', '🪟', POWERSHELL_DB[cmd]))
+    if current_platform != 'CMD' and cmd in CMD_DB:
+        other_platforms.append(('CMD', '⊞', CMD_DB[cmd]))
+    
+    if not other_platforms:
+        return
+    
+    print(f"{Colors.BOLD}{Colors.YELLOW}🔀 CROSS-PLATFORM DIFFERENCES:{Colors.END}\n")
+    print(f"'{cmd}' also exists on other platforms with different flags:\n")
+    
+    for platform, icon, info in other_platforms:
+        print(f"{Colors.BOLD}{icon} {platform}:{Colors.END}")
+        
+        # Show different flags
+        flag_key = 'common_parameters' if platform == 'PowerShell' else 'common_flags'
+        if flag_key in info and info[flag_key]:
+            flags = list(info[flag_key].items())[:5]
+            for flag, desc in flags:
+                print(f"  {Colors.CYAN}{flag:15}{Colors.END} {desc}")
+            if len(info[flag_key]) > 5:
+                print(f"  {Colors.YELLOW}... and {len(info[flag_key]) - 5} more flags{Colors.END}")
+        else:
+            print(f"  {Colors.YELLOW}(No flags - different behavior){Colors.END}")
+        
+        # Show example
+        if info.get('examples'):
+            print(f"  {Colors.YELLOW}Example: {info['examples'][0]}{Colors.END}")
+        
+        print()
+
+def list_commands(platform_filter=None):
+    """List all available commands"""
+    print(f"\n{Colors.BOLD}{Colors.CYAN}📚 Available Commands{Colors.END}\n")
+    
+    if platform_filter:
+        if platform_filter == 'linux':
+            commands = LINUX_DB
+            print(f"{Colors.BLUE}Showing Linux commands only ({LINUX_COUNT} commands) 🐧{Colors.END}\n")
+        elif platform_filter == 'powershell':
+            commands = POWERSHELL_DB
+            print(f"{Colors.BLUE}Showing PowerShell commands only ({POWERSHELL_COUNT} commands) 🪟{Colors.END}\n")
+        elif platform_filter == 'cmd':
+            commands = CMD_DB
+            print(f"{Colors.BLUE}Showing CMD commands only ({CMD_COUNT} commands) ⊞{Colors.END}\n")
+        else:
+            print(f"{Colors.RED}Unknown platform: {platform_filter}{Colors.END}")
+            print(f"{Colors.YELLOW}Valid options: linux, powershell, cmd{Colors.END}\n")
+            return
+    else:
+        commands = COMMAND_DB
+        print(f"{Colors.BLUE}Total: {DB_SIZE} commands ({LINUX_COUNT} Linux 🐧 + {POWERSHELL_COUNT} PowerShell 🪟 + {CMD_COUNT} CMD ⊞){Colors.END}\n")
+    
+    # Group commands by category
+    by_category = {}
+    for cmd, info in commands.items():
+        category = info.get('category', 'Other')
+        if category not in by_category:
+            by_category[category] = []
+        by_category[category].append((cmd, info['desc']))
+    
+    # Display by category
+    for category in sorted(by_category.keys()):
+        print(f"{Colors.BOLD}{Colors.GREEN}{category}:{Colors.END}")
+        for cmd, desc in sorted(by_category[category]):
+            # Add platform indicator
+            if cmd in CMD_DB:
+                icon = '⊞'
+            elif cmd in POWERSHELL_DB:
+                icon = '🪟'
+            else:
+                icon = '🐧'
+            print(f"  {icon} {Colors.CYAN}{cmd:20}{Colors.END} {desc}")
+        print()
+
+def print_banner():
+    """Print colorful banner"""
+    print(f"""
+{Colors.BOLD}{Colors.CYAN}╔═══════════════════════════════════════════════════════════╗
+║                                                           ║
+║                   🚀 CMDHELP v3.2                         ║
+║          Universal Command Line Helper                   ║
+║                                                           ║
+║     {Colors.GREEN}Linux 🐧  + PowerShell 🪟  + CMD ⊞{Colors.CYAN}            ║
+║                                                           ║
+╚═══════════════════════════════════════════════════════════╝{Colors.END}
+
+{Colors.YELLOW}Intelligent Pattern Matching • Cross-Platform • Fuzzy Search{Colors.END}
+{Colors.BLUE}Database: {DB_SIZE} commands{Colors.END}
+{Colors.GREEN}Platform: {CURRENT_PLATFORM.title()}{Colors.END}
+""")
+
+def show_help():
+    """Show usage help"""
+    print_banner()
+    print(f"""
+{Colors.BOLD}{Colors.CYAN}USAGE:{Colors.END}
+  {Colors.GREEN}cmdhelp <command>{Colors.END}                 Explain a specific command
+  {Colors.GREEN}cmdhelp suggest "task"{Colors.END}           Suggest command for a task (auto-detects platform)
+  {Colors.GREEN}cmdhelp suggest "task" linux{Colors.END}     Suggest Linux command
+  {Colors.GREEN}cmdhelp suggest "task" powershell{Colors.END} Suggest PowerShell command
+  {Colors.GREEN}cmdhelp list{Colors.END}                    List all commands
+  {Colors.GREEN}cmdhelp list linux{Colors.END}               List Linux commands only
+
+{Colors.BOLD}{Colors.CYAN}EXAMPLES:{Colors.END}
+  {Colors.YELLOW}cmdhelp tar -xzvf{Colors.END}                     Explain tar command with flags
+  {Colors.YELLOW}cmdhelp Get-ChildItem{Colors.END}                 Explain PowerShell command
+  {Colors.YELLOW}cmdhelp suggest "find large files"{Colors.END}    Get command suggestion
+  {Colors.YELLOW}cmdhelp suggest "compress folder"{Colors.END}     Find compression command
+""")
+
+
+def main():
+    """Main entry point"""
+    if len(sys.argv) < 2:
+        show_help()
+        return
+    
+    command = sys.argv[1].lower()
+    
+    if command in ['help', '--help', '-h']:
+        show_help()
+    elif command == 'list':
+        platform_filter = sys.argv[2].lower() if len(sys.argv) > 2 else None
+        list_commands(platform_filter)
+    elif command == 'suggest':
+        if len(sys.argv) < 3:
+            print(f"{Colors.RED}Error: Please provide a description{Colors.END}")
+            print(f"{Colors.YELLOW}Usage: cmdhelp suggest \"what you want to do\"{Colors.END}\n")
+            return
+        description = sys.argv[2]
+        force_platform = sys.argv[3].lower() if len(sys.argv) > 3 else None
+        if force_platform and force_platform not in ['linux', 'powershell', 'cmd']:
+            print(f"{Colors.RED}Error: Invalid platform '{force_platform}'{Colors.END}")
+            print(f"{Colors.YELLOW}Valid platforms: linux, powershell, cmd{Colors.END}\n")
+            return
+        suggest_command(description, force_platform)
+    elif command == 'explain':
+        # Handle "cmdhelp explain <command>"
+        if len(sys.argv) < 3:
+            print(f"{Colors.RED}Error: Please specify a command to explain{Colors.END}")
+            print(f"{Colors.YELLOW}Usage: cmdhelp explain <command>{Colors.END}\n")
+            return
+        cmd_string = ' '.join(sys.argv[2:])
+        explain_command(cmd_string)
+    else:
+        # Treat as command to explain
+        cmd_string = ' '.join(sys.argv[1:])
+        explain_command(cmd_string)
+
+if __name__ == '__main__':
+    main()
